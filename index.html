@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Reyse Ops Console</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #0b0d14; height: 100%; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; left: 14px; bottom: 12px;
+    font: 11px/1.4 'Courier New', monospace;
+    color: rgba(232,233,240,0.35);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    pointer-events: none;
+    user-select: none;
+  }
+  #fps {
+    position: fixed; right: 14px; top: 12px;
+    font: 11px/1.4 'Courier New', monospace;
+    color: rgba(232,233,240,0.4);
+    pointer-events: none;
+    user-select: none;
+    display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<div id="hud">reyse ops · idle</div>
+<div id="fps">0 fps</div>
+<script>
+(function () {
+  "use strict";
+
+  // ---------- Brand palette (reyse-app "command centre" tokens) ----------
+  const COLORS = {
+    bg: "#0b0d14",
+    bgVignette: "#05060a",
+    indigo: "#6366f1",
+    indigoDeep: "#312e81",
+    gold: "#f59e0b",
+    goldDeep: "#b45309",
+    ink: "#e8e9f0",
+    inkMuted: "#8b90a3",
+    danger: "#ef4444",
+  };
+
+  // ---------- State targets: how hard the scene moves/glows per state ----------
+  const STATE_TARGETS = {
+    idle:      { motion: 0.20, glow: 0.15 },
+    listening: { motion: 0.45, glow: 0.35 },
+    thinking:  { motion: 0.90, glow: 0.55 },
+    speaking:  { motion: 0.35, glow: 1.00 },
+  };
+  const VALID_STATES = Object.keys(STATE_TARGETS);
+
+  const DPR = Math.min(window.devicePixelRatio || 1, 1.25);
+
+  // ---------- URL params (mock harness) ----------
+  const params = new URLSearchParams(location.search);
+  const mockStateParam = params.get("mockstate");
+  const shotState = params.get("shot");
+  const shotT = parseFloat(params.get("t") || "0");
+  const isShot = shotState !== null;
+
+  // ---------- Canvas setup ----------
+  const canvas = document.getElementById("scene");
+  const ctx = canvas.getContext("2d");
+  const bakedCanvas = document.createElement("canvas");
+  const bakedCtx = bakedCanvas.getContext("2d");
+
+  const hud = document.getElementById("hud");
+  const fpsEl = document.getElementById("fps");
+
+  let W = 0, H = 0, CX = 0, CY = 0;
+  let network = { nodes: [], edges: [] };
+  let particles = [];
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    CX = W / 2;
+    CY = H / 2;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    bakedCanvas.width = canvas.width;
+    bakedCanvas.height = canvas.height;
+    bakedCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    buildNetwork();
+    bakeBackground();
+
+    // Headless Chrome fires a late resize that clears the canvas after our
+    // synchronous shot render — re-render on resize so screenshots don't come
+    // back black.
+    if (isShot) renderShot();
+  }
+
+  // ---------- Network (baked, static) ----------
+  function buildNetwork() {
+    const rings = 4;
+    const nodes = [];
+    const minDim = Math.min(W, H);
+    const outerRadius = minDim * 0.46;
+    const innerRadius = minDim * 0.16;
+
+    for (let r = 0; r < rings; r++) {
+      const radius = innerRadius + (outerRadius - innerRadius) * (r / (rings - 1));
+      const count = 6 + r * 5;
+      for (let i = 0; i < count; i++) {
+        const angle = (i / count) * Math.PI * 2 + r * 0.35;
+        nodes.push({
+          x: CX + Math.cos(angle) * radius,
+          y: CY + Math.sin(angle) * radius,
+          ring: r,
+        });
+      }
+    }
+
+    const edges = [];
+    for (let i = 0; i < nodes.length; i++) {
+      let best = [];
+      for (let j = 0; j < nodes.length; j++) {
+        if (i === j) continue;
+        const dx = nodes[i].x - nodes[j].x;
+        const dy = nodes[i].y - nodes[j].y;
+        const d = Math.sqrt(dx * dx + dy * dy);
+        best.push([j, d]);
+      }
+      best.sort((a, b) => a[1] - b[1]);
+      for (let k = 0; k < 2; k++) {
+        if (!best[k]) continue;
+        const j = best[k][0];
+        const key = i < j ? i + "-" + j : j + "-" + i;
+        if (!edges.some((e) => e.key === key)) {
+          edges.push({ key, a: i, b: j });
+        }
+      }
+    }
+
+    network = { nodes, edges };
+    particles = edges.map((e, idx) => ({
+      edge: e,
+      t: (idx * 0.13) % 1,
+      speed: 0.15 + Math.random() * 0.25,
+    }));
+  }
+
+  function bakeBackground() {
+    bakedCtx.clearRect(0, 0, W, H);
+    bakedCtx.fillStyle = COLORS.bg;
+    bakedCtx.fillRect(0, 0, W, H);
+
+    bakedCtx.strokeStyle = "rgba(99,102,241,0.10)";
+    bakedCtx.lineWidth = 1;
+    for (const e of network.edges) {
+      const a = network.nodes[e.a], b = network.nodes[e.b];
+      bakedCtx.beginPath();
+      bakedCtx.moveTo(a.x, a.y);
+      bakedCtx.lineTo(b.x, b.y);
+      bakedCtx.stroke();
+    }
+
+    bakedCtx.fillStyle = "rgba(99,102,241,0.25)";
+    for (const n of network.nodes) {
+      bakedCtx.beginPath();
+      bakedCtx.arc(n.x, n.y, 1.6, 0, Math.PI * 2);
+      bakedCtx.fill();
+    }
+  }
+
+  // ---------- The R monogram (matches the reyse.co.uk logo mark) ----------
+  const MONOGRAM_PATH = new Path2D(
+    "M10 6 H24 C30 6 32 10 32 14 C32 18 30 22 24 22 H10 V6 Z M18 22 L30 34"
+  );
+
+  function drawMonogram(glow, colorMix) {
+    const scale = Math.min(W, H) * 0.30 / 40;
+    ctx.save();
+    ctx.translate(CX, CY);
+    ctx.scale(scale, scale);
+    ctx.translate(-20, -20);
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+
+    const core = mixColor(COLORS.indigo, COLORS.gold, colorMix);
+
+    // Manual glow: layered translucent passes rather than shadowBlur, which
+    // gets distorted by the ctx.scale() transform above.
+    const glowPasses = [
+      { width: 3.5 + 22 * glow, alpha: 0.05 * glow },
+      { width: 3.5 + 12 * glow, alpha: 0.10 * glow },
+      { width: 3.5 + 5 * glow, alpha: 0.18 * glow },
+    ];
+    for (const p of glowPasses) {
+      ctx.strokeStyle = toRgba(core, p.alpha);
+      ctx.lineWidth = p.width;
+      ctx.stroke(MONOGRAM_PATH);
+    }
+
+    ctx.strokeStyle = core;
+    ctx.lineWidth = 3.5;
+    ctx.stroke(MONOGRAM_PATH);
+    ctx.restore();
+  }
+
+  function mixColor(hexA, hexB, t) {
+    const a = hexToRgb(hexA), b = hexToRgb(hexB);
+    const r = Math.round(a.r + (b.r - a.r) * t);
+    const g = Math.round(a.g + (b.g - a.g) * t);
+    const bl = Math.round(a.b + (b.b - a.b) * t);
+    return `rgb(${r},${g},${bl})`;
+  }
+  function hexToRgb(hex) {
+    const n = parseInt(hex.slice(1), 16);
+    return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+  }
+  function toRgba(color, a) {
+    let r, g, b;
+    if (color[0] === "#") {
+      const c = hexToRgb(color);
+      r = c.r; g = c.g; b = c.b;
+    } else {
+      const m = color.match(/\d+/g);
+      r = m[0]; g = m[1]; b = m[2];
+    }
+    return `rgba(${r},${g},${b},${a})`;
+  }
+
+  // ---------- Listening ring: pulses inward, reads as "taking something in" ----------
+  function drawListeningRing(phase) {
+    const minDim = Math.min(W, H);
+    const outer = minDim * 0.42;
+    const inner = minDim * 0.14;
+    for (let i = 0; i < 3; i++) {
+      const p = (phase + i / 3) % 1;
+      const radius = outer - (outer - inner) * p;
+      const alpha = (1 - p) * 0.35;
+      ctx.beginPath();
+      ctx.arc(CX, CY, radius, 0, Math.PI * 2);
+      ctx.strokeStyle = toRgba(COLORS.indigo, alpha);
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+
+  // ---------- Thinking sweep: radar wedge + node flicker ----------
+  let flickerNodes = [];
+  let flickerTimer = 0;
+  const SWEEP_WIDTH = 0.6; // radians
+  function drawThinkingSweep(angle, dt) {
+    const minDim = Math.min(W, H);
+    const radius = minDim * 0.46;
+    const grad = ctx.createConicGradient
+      ? ctx.createConicGradient(angle, CX, CY)
+      : null;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(CX, CY);
+    ctx.arc(CX, CY, radius, angle, angle + SWEEP_WIDTH);
+    ctx.closePath();
+    if (grad) {
+      // Comet-tail: bright at the leading edge, gone by the trailing edge.
+      // Gradient stops are fractions of the FULL circle, so they must be
+      // scaled down to the wedge's own (small) angular width.
+      const wedgeFrac = SWEEP_WIDTH / (Math.PI * 2);
+      grad.addColorStop(0, toRgba(COLORS.gold, 0.4));
+      grad.addColorStop(wedgeFrac * 0.5, toRgba(COLORS.gold, 0.14));
+      grad.addColorStop(wedgeFrac, toRgba(COLORS.gold, 0));
+      grad.addColorStop(1, toRgba(COLORS.gold, 0));
+      ctx.fillStyle = grad;
+    } else {
+      ctx.fillStyle = "rgba(245,158,11,0.1)";
+    }
+    ctx.fill();
+    ctx.restore();
+
+    flickerTimer -= dt;
+    if (flickerTimer <= 0) {
+      flickerTimer = 0.12 + Math.random() * 0.1;
+      flickerNodes = [];
+      const count = 2 + Math.floor(Math.random() * 3);
+      for (let i = 0; i < count; i++) {
+        flickerNodes.push(network.nodes[Math.floor(Math.random() * network.nodes.length)]);
+      }
+    }
+    ctx.fillStyle = COLORS.gold;
+    for (const n of flickerNodes) {
+      if (!n) continue;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ---------- Alert overlay: unmistakable red bleed, layered over anything ----------
+  function drawAlertOverlay(strobe) {
+    const grad = ctx.createRadialGradient(CX, CY, Math.min(W, H) * 0.2, CX, CY, Math.max(W, H) * 0.75);
+    grad.addColorStop(0, toRgba(COLORS.danger, 0));
+    grad.addColorStop(1, toRgba(COLORS.danger, 0.35 + 0.25 * strobe));
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.strokeStyle = toRgba(COLORS.danger, 0.6 + 0.4 * strobe);
+    ctx.lineWidth = 10;
+    ctx.strokeRect(5, 5, W - 10, H - 10);
+  }
+
+  // ---------- Traveling signal particles ----------
+  function drawParticles(motionEnergy, dt) {
+    ctx.fillStyle = toRgba(COLORS.indigo, 0.9);
+    for (const p of particles) {
+      p.t += p.speed * motionEnergy * dt * 0.6;
+      if (p.t > 1) p.t -= 1;
+      const a = network.nodes[p.edge.a], b = network.nodes[p.edge.b];
+      const x = a.x + (b.x - a.x) * p.t;
+      const y = a.y + (b.y - a.y) * p.t;
+      const size = 1.2 + motionEnergy * 1.6;
+      ctx.beginPath();
+      ctx.arc(x, y, size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // ---------- Easing ----------
+  function approach(current, target, dt, attackTau, releaseTau) {
+    const tau = target > current ? attackTau : releaseTau;
+    const k = 1 - Math.exp(-dt / tau);
+    return current + (target - current) * k;
+  }
+
+  // ---------- Runtime state ----------
+  let curState = "idle";
+  let curLevel = 0;
+  let curAlert = false;
+  let lastGoodDataAt = performance.now();
+  let pollFailing = false;
+
+  let motionEnergy = STATE_TARGETS.idle.motion;
+  let glowEnergy = STATE_TARGETS.idle.glow;
+  let smoothLevel = 0;
+  let thinkingBurst = 0;
+  let prevState = "idle";
+  let ringPhase = 0;
+  let sweepAngle = 0;
+  let strobePhase = 0;
+
+  let booted = isShot; // shots skip the boot intro entirely
+  let bootT = 0;
+  const BOOT_DURATION = 1.2;
+
+  function skipBoot() {
+    booted = true;
+  }
+  window.addEventListener("keydown", (e) => {
+    if (!booted) { skipBoot(); return; }
+    if (e.key === "f" || e.key === "F") {
+      fpsEl.style.display = fpsEl.style.display === "none" ? "block" : "none";
+    }
+  });
+  window.addEventListener("pointerdown", () => { if (!booted) skipBoot(); });
+
+  // ---------- Data source: real /state, mock loop, or ?mockstate ----------
+  function applyIncoming(data) {
+    if (!data || VALID_STATES.indexOf(data.state) === -1) return;
+    curState = data.state;
+    curLevel = Math.max(0, Math.min(1, data.level || 0));
+    curAlert = !!data.alert;
+    lastGoodDataAt = performance.now();
+    pollFailing = false;
+  }
+
+  if (mockStateParam !== null) {
+    // Fully local simulation, never touches /state.
+    const fixedState = VALID_STATES.indexOf(mockStateParam) !== -1 ? mockStateParam : "idle";
+    let t0 = performance.now();
+    setInterval(() => {
+      const t = (performance.now() - t0) / 1000;
+      const level = fixedState === "speaking" ? Math.max(0, Math.sin(t * 2.4)) * 0.8 + 0.15 : 0;
+      applyIncoming({ state: fixedState, level, alert: params.get("alert") === "1" });
+    }, 100);
+  } else if (!isShot) {
+    async function poll() {
+      try {
+        const res = await fetch("/state", { cache: "no-store" });
+        if (res.ok) {
+          applyIncoming(await res.json());
+        } else {
+          pollFailing = true;
+        }
+      } catch (e) {
+        pollFailing = true;
+      }
+    }
+    poll();
+    setInterval(poll, 100);
+  }
+
+  // ---------- Main update + draw ----------
+  function update(dt) {
+    // If the server's gone quiet for a while, ease back to idle on its own
+    // rather than freezing mid-state.
+    if (pollFailing && performance.now() - lastGoodDataAt > 800) {
+      curState = "idle";
+      curLevel = 0;
+      curAlert = false;
+    }
+
+    if (curState !== prevState) {
+      if (curState === "thinking") thinkingBurst = 1;
+      prevState = curState;
+    }
+    thinkingBurst = approach(thinkingBurst, 0, dt, 0.05, 0.6);
+
+    const target = STATE_TARGETS[curState] || STATE_TARGETS.idle;
+    motionEnergy = approach(motionEnergy, target.motion + thinkingBurst * 0.3, dt, 0.5, 1.0);
+    glowEnergy = approach(glowEnergy, target.glow, dt, 0.5, 1.0);
+    smoothLevel = approach(smoothLevel, curState === "speaking" ? curLevel : 0, dt, 0.09, 0.09);
+
+    ringPhase = (ringPhase + dt * 0.5) % 1;
+    sweepAngle += dt * (1.2 + motionEnergy);
+    strobePhase += dt * 4;
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+    ctx.drawImage(bakedCanvas, 0, 0, W, H);
+
+    drawParticles(motionEnergy, 1 / 60);
+
+    if (curState === "listening") drawListeningRing(ringPhase);
+    if (curState === "thinking") drawThinkingSweep(sweepAngle, 1 / 60);
+
+    const speakingGlow = curState === "speaking" ? Math.max(glowEnergy, smoothLevel) : glowEnergy;
+    const colorMix = curAlert ? 0 : (curState === "speaking" ? Math.min(1, 0.5 + smoothLevel * 0.5) : glowEnergy * 0.6);
+    drawMonogram(curAlert ? 0.9 : speakingGlow, colorMix);
+
+    if (curAlert) {
+      drawAlertOverlay((Math.sin(strobePhase) + 1) / 2);
+    }
+
+    if (!booted) drawBoot();
+
+    hud.textContent = "reyse ops · " + curState + (curAlert ? " · alert" : "");
+  }
+
+  function drawBoot() {
+    const p = Math.min(1, bootT / BOOT_DURATION);
+    ctx.fillStyle = COLORS.bg;
+    ctx.fillRect(0, 0, W, H);
+    drawMonogram(p, 0.2);
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, p - 0.3) / 0.7;
+    ctx.fillStyle = COLORS.ink;
+    ctx.font = "600 20px 'Courier New', monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("REYSE", CX, CY + Math.min(W, H) * 0.22);
+    ctx.font = "11px 'Courier New', monospace";
+    ctx.fillStyle = COLORS.inkMuted;
+    ctx.fillText("OPERATING SYSTEM ONLINE", CX, CY + Math.min(W, H) * 0.22 + 20);
+    ctx.restore();
+    if (p >= 1) booted = true;
+  }
+
+  // ---------- Deterministic shot rendering (?shot=state&t=ms) ----------
+  function renderShot() {
+    const state = VALID_STATES.indexOf(shotState) !== -1 ? shotState : "idle";
+    curState = state;
+    prevState = state === "thinking" ? "idle" : state; // don't fake a burst unless asked
+    curAlert = params.get("alert") === "1";
+    motionEnergy = STATE_TARGETS.idle.motion;
+    glowEnergy = STATE_TARGETS.idle.glow;
+    smoothLevel = 0;
+    thinkingBurst = state === "thinking" ? 1 : 0;
+    ringPhase = 0;
+    sweepAngle = 0;
+    strobePhase = 0;
+
+    const stepMs = 16;
+    let elapsed = 0;
+    curLevel = state === "speaking" ? 0.6 : 0;
+    while (elapsed < shotT) {
+      const dt = Math.min(stepMs, shotT - elapsed) / 1000;
+      if (state === "speaking") {
+        curLevel = Math.max(0, Math.sin((elapsed / 1000) * 2.4)) * 0.8 + 0.15;
+      }
+      update(dt);
+      elapsed += stepMs;
+    }
+    draw();
+  }
+
+  // ---------- FPS meter ----------
+  let fpsFrames = 0, fpsLast = performance.now(), fpsAcc = 0;
+  function updateFps(dt) {
+    fpsFrames++;
+    fpsAcc += dt;
+    if (fpsAcc >= 0.5) {
+      fpsEl.textContent = Math.round(fpsFrames / fpsAcc) + " fps";
+      fpsFrames = 0;
+      fpsAcc = 0;
+    }
+  }
+
+  // ---------- Main loop ----------
+  let lastFrame = null;
+  function frame(now) {
+    if (lastFrame === null) lastFrame = now;
+    const dt = Math.min(0.1, (now - lastFrame) / 1000);
+    lastFrame = now;
+
+    if (!booted) bootT += dt;
+    update(dt);
+    draw();
+    updateFps(dt);
+
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener("resize", resize);
+  resize();
+
+  if (isShot) {
+    renderShot();
+  } else {
+    requestAnimationFrame(frame);
+  }
+})();
+</script>
+</body>
+</html>
