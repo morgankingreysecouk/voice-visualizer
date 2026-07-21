@@ -10,6 +10,9 @@ the same Chromebook as `voice-line`, since that's where those files live.
 You need `~/voice-line` and `~/voice-visualizer` (this folder) both cloned
 onto the same machine, in your home folder, at those exact names.
 
+First time only, make the launcher runnable: `chmod +x launch.sh` (GitHub
+doesn't carry that permission across on its own).
+
 - **With the voice line running:** `./launch.sh` — starts the local server
   if it's not already running, then opens the scene fullscreen.
 - **On its own, no voice line needed:** `./launch.sh --mock` — cycles through
